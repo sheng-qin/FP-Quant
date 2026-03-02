@@ -1,14 +1,16 @@
 import random
+import os
+import json
 from typing import Optional, List
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 
 
 # Only for evaluation
 def get_wikitext2(tokenizer: AutoTokenizer,  sequence_length: int):
-    test_dataset_raw = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    test_dataset_raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     test_dataset_tok = tokenizer("\n\n".join(test_dataset_raw["text"]), return_tensors="pt").input_ids
     num_test_sequences = test_dataset_tok.numel() // sequence_length
     test_loader = []
@@ -112,10 +114,17 @@ def get_fineweb_edu(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
     num_calibration_samples: Optional[int] = None,
-    seed: int = 42
+    seed: int = 42,
+    local_data_file: Optional[str] = "",
 ) -> List[torch.Tensor]:
-    train_dataset_raw = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
-    train_dataset_raw = train_dataset_raw.shuffle(seed=seed, buffer_size=1_000)
+    if local_data_file and os.path.exists(local_data_file):
+        print(f"Loading dataset from local file: {local_data_file}")
+        with open(local_data_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        train_dataset_raw = Dataset.from_list(data)
+    else:
+        train_dataset_raw = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+        train_dataset_raw = train_dataset_raw.shuffle(seed=seed, buffer_size=1_000)
     trainloader = []
     for j, sample in enumerate(train_dataset_raw):
         trainenc = tokenizer(
@@ -124,6 +133,7 @@ def get_fineweb_edu(
         )
         if trainenc.input_ids.shape[1] < max_sequence_length:
             continue
+        random.seed(seed)
         i = random.randint(0, trainenc.input_ids.shape[1] - max_sequence_length)
         tokenized_sample = trainenc.input_ids[:, i:i + max_sequence_length]
         trainloader.append(tokenized_sample)

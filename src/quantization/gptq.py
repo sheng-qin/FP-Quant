@@ -321,10 +321,7 @@ def gptq_quantization(
         block.requires_grad_(False)
 
         # 3. Fix transforms and remove parametrizations
-        qkv_in_transform.remove_parametrizations()
-        o_in_transform.remove_parametrizations()
-        gate_up_in_transform.remove_parametrizations()
-        down_in_transform.remove_parametrizations() 
+        ## removed
 
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
@@ -341,19 +338,8 @@ def gptq_quantization(
                 )
                 # Get weight global scale
                 if args.scale_precision == ScalePrecision.E4M3:
-                    # Rotate weight
-                    with torch.no_grad():
-                        if re.search("(q|k|v)_proj", layer_name):
-                            layer_transform = qkv_in_transform
-                        elif re.search("o_proj", layer_name):
-                            layer_transform = o_in_transform
-                        elif re.search("(gate|up)_proj", layer_name):
-                            layer_transform = gate_up_in_transform
-                        else:
-                            layer_transform = down_in_transform
-                        weight = layer_transform(layer.weight, inv_t=True)
-                    
-                    gptq_handles[layer_name].quantizer.get_quantization_params(weight)
+                    ## removed
+                    gptq_handles[layer_name].quantizer.get_global_scale(layer.weight)
                     # Turn off global scale tracking
                     gptq_handles[layer_name].quantizer._track_global_scale = False
                 # Attach hook
@@ -392,13 +378,7 @@ def gptq_quantization(
             hook.remove()
 
         # 6. Transform all weights before quantization
-        block.self_attn.q_proj.weight.data = qkv_in_transform(block.self_attn.q_proj.weight, inv_t=True)
-        block.self_attn.k_proj.weight.data = qkv_in_transform(block.self_attn.k_proj.weight, inv_t=True)
-        block.self_attn.v_proj.weight.data = qkv_in_transform(block.self_attn.v_proj.weight, inv_t=True)
-        block.self_attn.o_proj.weight.data = o_in_transform(block.self_attn.o_proj.weight, inv_t=True)
-        block.mlp.gate_proj.weight.data = gate_up_in_transform(block.mlp.gate_proj.weight, inv_t=True)
-        block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
-        block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
+        ## removed
         # Set train_mode to False
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
@@ -420,7 +400,7 @@ def gptq_quantization(
             # Update quantized state dict (if needed)
             if args.export_quantized_model:
                 weight_global_scale = gptq_handle.quantizer.global_scale.to(scales.device)
-                act_global_scale = gptq_handle.layer.act_quantizer.global_scale
+                act_global_scale = gptq_handle.layer.act_quantizer.global_scale if gptq_handle.layer.act_quantizer else torch.ones_like(weight_global_scale)
 
                 transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
@@ -466,5 +446,18 @@ def gptq_quantization(
         clear_device_cache(garbage_collection=True)
 
     clear_device_cache(garbage_collection=True)
+    if args.export_quantized_model == "realquant":
+        import os
+        from safetensors.torch import save_file
+        model_state_dict = {}
+        
+        for key, value in quantized_state_dict.items():
+            for k_compr, v_compr in value.items():
+                    model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
+        
+        os.makedirs(args.save_path, exist_ok=True)
+        rank_path = f"rank0_of_1.safetensors"
+        print(rank_path)
+        save_file(model_state_dict, os.path.join(args.save_path, rank_path))
 
     return quantized_state_dict, non_quantized_state_dict

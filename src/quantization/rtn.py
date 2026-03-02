@@ -23,7 +23,7 @@ def rtn_quantization(
     print("RTN quantization...")
     orig_dtype = model.config.torch_dtype if args.dtype == "auto" else args.dtype
     act_offload_device = "cpu" if args.cpu_offload_activations else device
-    need_calibration = args.scale_precision == ScalePrecision.E4M3
+    need_calibration = args.a_bits < 16 and args.scale_precision == ScalePrecision.E4M3
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
@@ -118,16 +118,8 @@ def rtn_quantization(
             for layer_name, layer in block.named_modules():
                 if isinstance(layer, QLinear):
                     with torch.no_grad():
-                        if re.search("(q|k|v)_proj", layer_name):
-                            layer_transform = qkv_in_transform
-                        elif re.search("o_proj", layer_name):
-                            layer_transform = o_in_transform
-                        elif re.search("(gate|up)_proj", layer_name):
-                            layer_transform = gate_up_in_transform
-                        else:
-                            layer_transform = down_in_transform
-                        weight = layer_transform(layer.weight, inv_t=True)
-                        layer.weight_quantizer.get_quantization_params(weight)
+                        ## removed
+                        layer.weight_quantizer.get_global_scale(layer.weight)
                         # Stop tracking global scale
                         layer.weight_quantizer._track_global_scale = False
 
@@ -160,25 +152,17 @@ def rtn_quantization(
             for layer_name, layer in block.named_modules():
                 if isinstance(layer, QLinear):
                     with torch.no_grad():
-                        if re.search("(q|k|v)_proj", layer_name):
-                            layer_transform = qkv_in_transform
-                        elif re.search("o_proj", layer_name):
-                            layer_transform = o_in_transform
-                        elif re.search("(gate|up)_proj", layer_name):
-                            layer_transform = gate_up_in_transform
-                        else:
-                            layer_transform = down_in_transform
-
-                        weight = layer_transform(layer.weight, inv_t=True)
-                        scales, zeros = layer.weight_quantizer.get_quantization_params(weight)
-                        qweight = layer.weight_quantizer.quantize(weight, scales, zeros)
+                        ## removed
+                        scales, zeros = layer.weight_quantizer.get_quantization_params(layer.weight)
+                        qweight = layer.weight_quantizer.quantize(layer.weight, scales, zeros)
 
                     weight_global_scale = layer.weight_quantizer.global_scale.to(scales.device)
-                    act_global_scale = layer.act_quantizer.global_scale
+                    act_global_scale = layer.act_quantizer.global_scale if layer.act_quantizer else torch.ones_like(weight_global_scale)
 
                     # Stop tracking global scale
                     layer.weight_quantizer._track_global_scale = False
-                    layer.act_quantizer._track_global_scale = False
+                    if layer.act_quantizer:
+                        layer.act_quantizer._track_global_scale = False
 
                     transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
@@ -205,13 +189,9 @@ def rtn_quantization(
         
 
         # 3. Fix model parametrization
-        quantized_attn.fix_parametrization()
-        quantized_mlp.fix_parametrization()
+        ## removed
         # 4. Fix transforms and remove parametrizations
-        qkv_in_transform.remove_parametrizations()
-        o_in_transform.remove_parametrizations()
-        gate_up_in_transform.remove_parametrizations()
-        down_in_transform.remove_parametrizations() 
+        ## removed
 
         if need_calibration:
             device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
@@ -233,5 +213,18 @@ def rtn_quantization(
         clear_device_cache(garbage_collection=True)
 
     clear_device_cache(garbage_collection=True)
+    if args.export_quantized_model == "realquant":
+        import os
+        from safetensors.torch import save_file
+        model_state_dict = {}
+        
+        for key, value in quantized_state_dict.items():
+            for k_compr, v_compr in value.items():
+                    model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
+        
+        os.makedirs(args.save_path, exist_ok=True)
+        rank_path = f"rank0_of_1.safetensors"
+        print(rank_path)
+        save_file(model_state_dict, os.path.join(args.save_path, rank_path))
 
     return quantized_state_dict, non_quantized_state_dict

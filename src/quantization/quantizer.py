@@ -84,6 +84,20 @@ class Quantizer:
                 zeros = zeros.unsqueeze(dim + 1)
         return x, scales, zeros
 
+    def get_global_scale(
+        self,
+        x: torch.Tensor,
+    ):
+        if self._track_global_scale:
+            current_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(x.abs().max().to(torch.float32))
+            if not current_global_scale:
+                raise ValueError(f"Current global scale is not finite: {current_global_scale}\n")
+            # Update global scale using min of current and computed scale
+            self.global_scale = torch.minimum(self.global_scale.to(x.device), current_global_scale)
+            
+            if not self.global_scale.isfinite():
+                raise ValueError(f"Global scale is not finite: {self.global_scale}\n")
+
     def get_quantization_params(
         self, 
         x: torch.Tensor,

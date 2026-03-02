@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 from torch.nn.utils.parametrizations import _Orthogonal
-from fast_hadamard_transform import hadamard_transform
+# from fast_hadamard_transform import hadamard_transform
 
 
 MATRIX_INITS = ("identity", "orthogonal", "hadamard", "xavier_normal")

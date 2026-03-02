@@ -21,7 +21,7 @@ class QLinear(nn.Linear):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.weight_quantizer = weight_quantizer
         self.act_quantizer = act_quantizer
-        self._train_mode = True
+        self._train_mode = False
 
     def forward(
         self, 
@@ -45,8 +45,9 @@ class QLinear(nn.Linear):
                 weight = self.weight_quantizer(weight, w_scales, w_zeros)
 
         if self.act_quantizer is not None:
-            a_scales, a_zeros = self.act_quantizer.get_quantization_params(x)
-            x = self.act_quantizer(x, a_scales, a_zeros)
+            self.act_quantizer.get_global_scale(x)
+            # a_scales, a_zeros = self.act_quantizer.get_quantization_params(x)
+            # x = self.act_quantizer(x, a_scales, a_zeros)
 
         return F.linear(x, weight, bias)
 

@@ -337,9 +337,9 @@ def parse_args():
     # Check real_quant config
     if args.export_quantized_model:
         assert args.save_path is not None, "`save_path` must be specified when exporting quantized model."
-        assert args.format in ["nvfp", "mxfp"], "`export_quantization` is only supported for nvfp and mxfp formats."
-        assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
-        assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
+        # assert args.format in ["nvfp", "mxfp"], "`export_quantization` is only supported for nvfp and mxfp formats."
+        # assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
+        # assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
     return args
 
 
@@ -395,9 +395,9 @@ def main():
         else:
             quantized_state_dict, non_quantized_state_dict = rtn_quantization(model, calibration_data, args, device)
 
-        if args.export_quantized_model:
-            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
-            tokenizer.save_pretrained(args.save_path)
+        # if args.export_quantized_model:
+        #     export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
+        #     tokenizer.save_pretrained(args.save_path)
 
     if args.compile:
         model = torch.compile(model)

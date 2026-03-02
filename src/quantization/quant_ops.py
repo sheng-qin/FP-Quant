@@ -111,7 +111,7 @@ def get_quantization_fns(format: QuantizationFormat, bits: int) -> Tuple[Callabl
 def cast_scales_to_eXmY(scales: torch.Tensor, scale_precision: str) -> torch.Tensor:
     scale_precision = ScalePrecision(scale_precision)
     if scale_precision == ScalePrecision.E4M3:
-        return scales.to(torch.float8_e4m3fn).view(torch.uint8)
+        return scales.to(torch.float8_e4m3fn)#.view(torch.uint8)
     elif scale_precision == ScalePrecision.E8M0:
         # 2 is EMAX
         scales = scales.to(torch.float8_e8m0fnu).view(torch.uint8)

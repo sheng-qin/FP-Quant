@@ -5,6 +5,7 @@ import warnings
 from functools import partial
 
 import torch
+import torch.distributed as dist
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import lm_eval
@@ -308,6 +309,20 @@ def parse_args():
         default=5 * 1024 * 1024 * 1024, 
         help="Maximum shard size in bytes."
     )
+    # Expert parallel params
+    parser.add_argument(
+        "--ep_size",
+        type=int,
+        default=1,
+        help="Expert parallel size (number of GPUs for expert parallelism)."
+    )
+    parser.add_argument(
+        "--ep_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="Backend for distributed training."
+    )
     # Parse arguments
     args = parser.parse_args()
     # Check and fix group_size (if needed)
@@ -347,23 +362,62 @@ def main():
     args = parse_args()
     # Fix seed
     fix_seed(args.seed)
+    
+    # Initialize distributed for expert parallel
+    rank = 0
+    world_size = 1
+    if args.ep_size > 1:
+        if not dist.is_available():
+            raise RuntimeError("Distributed is not available. Please install torch with distributed support.")
+        dist.init_process_group(backend=args.ep_backend, init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(rank)
+        print(f"Initialized distributed: rank={rank}, world_size={world_size}, ep_size={args.ep_size}")
+    
     # Set device
-    device = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+    device = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else f"cuda:{rank}"
     # Get dtype
     if args.dtype != "auto":
         args.dtype = getattr(torch, args.dtype)
     # Init logger
     if args.log_wandb:
         wandb.init(config=args)
-    # Model
+    
+    # For EP, set ep_size in config BEFORE loading model so transformers creates num_local_experts
+    # This is how transformers handles expert parallelism
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    if args.ep_size > 1:
+        config.ep_size = args.ep_size
+        config.num_local_experts = config.num_experts // args.ep_size
+        print(f"Setting config.ep_size = {args.ep_size} for expert parallel")
+    
+    # Model - load on CPU first for EP
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, 
+        config=config,
         torch_dtype=args.dtype, 
-        device_map=None if args.cpu_offload_modules else device,
+        device_map="cpu" if args.ep_size > 1 else (None if args.cpu_offload_modules else device),
         low_cpu_mem_usage=True,
     )
+    
+    # Check if model has EP configuration (num_local_experts set by transformers)
+    is_moe = hasattr(model.config, 'num_local_experts') and model.config.num_local_experts > 1
+    
     model.config.use_cache = False
     model.requires_grad_(False)
+    
+    # For EP with large models, keep on CPU and use cpu_offload_modules
+    # This is because each rank cannot hold the full model in GPU memory
+    if args.ep_size > 1:
+        # Enable CPU offload for modules
+        args.cpu_offload_modules = True
+        print(f"Rank {rank}: EP enabled, using CPU offload for large model")
+    
+    if not args.cpu_offload_modules:
+        model = model.to(device)
+    
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
     # Sanity check
@@ -388,6 +442,12 @@ def main():
         args.num_sequences,
         args.seed
     )
+    
+    # Distribute calibration data across ranks for EP
+    if args.ep_size > 1:
+        num_seq_per_rank = len(calibration_data) // world_size
+        calibration_data = calibration_data[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
+        print(f"Rank {rank}: processing {len(calibration_data)} calibration sequences")
 
     if quantize_anything:
         if args.gptq:
@@ -476,6 +536,10 @@ def main():
         # Print formatted table
         print("### Final results ###")
         print(make_table({"results": results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+    
+    # Cleanup distributed
+    if args.ep_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

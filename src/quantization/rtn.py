@@ -4,6 +4,7 @@ import argparse
 from typing import List
 
 import torch
+import torch.distributed as dist
 from transformers import AutoModelForCausalLM
 
 from .qlinear import QLinear
@@ -27,6 +28,19 @@ def rtn_quantization(
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
+    
+    # Check for expert parallel
+    ep_size = 1
+    ep_rank = 0
+    ep_group = None
+    is_moe = hasattr(model.config, 'num_local_experts') and model.config.num_local_experts > 1
+    if is_moe and dist.is_available() and dist.is_initialized():
+        ep_size = dist.get_world_size()
+        ep_rank = dist.get_rank()
+        # Create expert parallel group for MoE models
+        ep_group = dist.group.WORLD
+        print(f"Expert parallel enabled: ep_size={ep_size}, ep_rank={ep_rank}, ep_group={ep_group}")
+    
     # Get transformer blocks
     blocks = model.model.layers
     # Define common transform kwargs
@@ -96,16 +110,66 @@ def rtn_quantization(
             qkv_in_transform=qkv_in_transform,
             o_in_transform=o_in_transform
         )
-        quantized_mlp = get_mlp_layer(model.config)(
-            model.config,
-            weight_quantizer_kwargs=weight_quantizer_kwargs,
-            act_quantizer_kwargs=act_quantizer_kwargs,
-            gate_up_in_transform=gate_up_in_transform,
-            down_in_transform=down_in_transform
-        )
+        
+        # For MoE models, use expert parallel if enabled
+        if is_moe:
+            # Get the MLP class with ep parameters
+            from functools import partial
+            mlp_class = get_mlp_layer(model.config, ep_size=ep_size, ep_rank=ep_rank, ep_group=ep_group)
+            quantized_mlp = mlp_class(
+                model.config,
+                weight_quantizer_kwargs=weight_quantizer_kwargs,
+                act_quantizer_kwargs=act_quantizer_kwargs,
+                gate_up_in_transform=gate_up_in_transform,
+                down_in_transform=down_in_transform
+            )
+        else:
+            quantized_mlp = get_mlp_layer(model.config)(
+                model.config,
+                weight_quantizer_kwargs=weight_quantizer_kwargs,
+                act_quantizer_kwargs=act_quantizer_kwargs,
+                gate_up_in_transform=gate_up_in_transform,
+                down_in_transform=down_in_transform
+            )
 
         quantized_attn.load_state_dict(block.self_attn.state_dict(), strict=False)
-        quantized_mlp.load_state_dict(block.mlp.state_dict(), strict=False)
+        
+        # For MoE with expert parallel, only load the local experts
+        # Check if model has num_local_experts (set by transformers when EP is enabled)
+        use_ep_filter = False
+        if hasattr(model.config, 'num_local_experts') and model.config.num_local_experts is not None:
+            total_experts = getattr(model.config, 'num_experts', None)
+            num_local_experts = model.config.num_local_experts
+            
+            # Only filter if we have both values and local < total
+            if total_experts is not None and num_local_experts < total_experts:
+                use_ep_filter = True
+                print(f"[Rank {ep_rank}] EP filter: total_experts={total_experts}, num_local_experts={num_local_experts}, ep_size={ep_size}")
+                
+                # Calculate which experts belong to this rank
+                num_experts_per_ep = num_local_experts
+                expert_start_idx = ep_rank * num_experts_per_ep
+                
+                # Get full state dict
+                state_dict = block.mlp.state_dict()
+                
+                # Filter to only include local experts
+                local_state_dict = {}
+                for key, value in state_dict.items():
+                    if 'experts.' in key:
+                        parts = key.split('.')
+                        exp_idx = int(parts[1])
+                        # Only include experts that belong to this rank
+                        if exp_idx >= expert_start_idx and exp_idx < expert_start_idx + num_experts_per_ep:
+                            local_key = key.replace(f'experts.{exp_idx}', f'experts.{exp_idx - expert_start_idx}')
+                            local_state_dict[local_key] = value
+                    else:
+                        local_state_dict[key] = value
+                
+                quantized_mlp.load_state_dict(local_state_dict, strict=False)
+        
+        if not use_ep_filter:
+            quantized_mlp.load_state_dict(block.mlp.state_dict(), strict=False)
 
         block.self_attn = quantized_attn
         block.mlp = quantized_mlp
@@ -132,13 +196,14 @@ def rtn_quantization(
                 quantized_attn.q_proj.weight_quantizer.global_scale = qkv_global_scale
                 quantized_attn.k_proj.weight_quantizer.global_scale = qkv_global_scale
                 quantized_attn.v_proj.weight_quantizer.global_scale = qkv_global_scale
-                # gate_up fusion
-                gate_up_global_scale = min(
-                    quantized_mlp.gate_proj.weight_quantizer.global_scale,
-                    quantized_mlp.up_proj.weight_quantizer.global_scale
-                )
-                quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
-                quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
+                if not is_moe:
+                    # gate_up fusion
+                    gate_up_global_scale = min(
+                        quantized_mlp.gate_proj.weight_quantizer.global_scale,
+                        quantized_mlp.up_proj.weight_quantizer.global_scale
+                    )
+                    quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
+                    quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
 
         # Calibrate activations (if needed)
         if need_calibration:
@@ -223,7 +288,7 @@ def rtn_quantization(
                     model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
         
         os.makedirs(args.save_path, exist_ok=True)
-        rank_path = f"rank0_of_1.safetensors"
+        rank_path = f"rank{ep_rank}_of_{ep_size}.safetensors"
         print(rank_path)
         save_file(model_state_dict, os.path.join(args.save_path, rank_path))
 

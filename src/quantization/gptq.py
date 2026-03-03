@@ -16,7 +16,7 @@ from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
 from ..transforms.transforms import build_transform, get_transform_matrix
 from ..utils.linalg_utils import inv_sym
-from ..utils.common_utils import clear_device_cache, to, maybe_first_element
+from ..utils.common_utils import clear_device_cache, to, maybe_first_element, get_global_layer_name
 from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_layer, get_mlp_layer, get_number_of_rows_and_cols
 
 try:
@@ -351,8 +351,7 @@ def gptq_quantization(
                 print(f"[Rank {ep_rank}] EP filter: total_experts={total_experts}, num_local_experts={num_local_experts}, ep_size={ep_size}")
                 
                 # Calculate which experts belong to this rank
-                num_experts_per_ep = num_local_experts
-                expert_start_idx = ep_rank * num_experts_per_ep
+                expert_start_idx = ep_rank * num_local_experts
                 
                 # Get full state dict
                 state_dict = block.mlp.state_dict()
@@ -364,7 +363,7 @@ def gptq_quantization(
                         parts = key.split('.')
                         exp_idx = int(parts[1])
                         # Only include experts that belong to this rank
-                        if exp_idx >= expert_start_idx and exp_idx < expert_start_idx + num_experts_per_ep:
+                        if exp_idx >= expert_start_idx and exp_idx < expert_start_idx + num_local_experts:
                             local_key = key.replace(f'experts.{exp_idx}', f'experts.{exp_idx - expert_start_idx}')
                             local_state_dict[local_key] = value
                     else:
@@ -468,24 +467,20 @@ def gptq_quantization(
 
                 transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
+                # Convert layer_name to use global expert index if EP is enabled
+                global_layer_name = get_global_layer_name(layer_name, ep_rank, model.config.num_local_experts) if is_moe and ep_size > 1 else layer_name
                 if args.export_quantized_model == "realquant":
-                    quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
-                        "qweight": pack_fp4_to_uint8(qweight).cpu(),
-                        "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
-                        "weight_global_scale": weight_global_scale.clone(),
-                        "act_global_scale": act_global_scale.clone()
+                    quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
+                        "weight": pack_fp4_to_uint8(qweight).cpu(),
+                        "weight_scale": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
+                        "weight_scale_2": 1 / weight_global_scale.clone(),
+                        "input_scale": 1 / act_global_scale.clone()
                     }
                 # pseudoquant
                 else:
-                    quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
-                        "dqweight": dequantized_qweight.cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
-                        "weight_global_scale": weight_global_scale.clone(),
-                        "act_global_scale": act_global_scale.clone()
-                    }
+                    quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
+                        "weight": dequantized_qweight.cpu(),
+                    }  
 
         # 8. Update activations
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
@@ -510,18 +505,5 @@ def gptq_quantization(
         clear_device_cache(garbage_collection=True)
 
     clear_device_cache(garbage_collection=True)
-    if args.export_quantized_model == "realquant":
-        import os
-        from safetensors.torch import save_file
-        model_state_dict = {}
-        
-        for key, value in quantized_state_dict.items():
-            for k_compr, v_compr in value.items():
-                    model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
-        
-        os.makedirs(args.save_path, exist_ok=True)
-        rank_path = f"rank{ep_rank}_of_{ep_size}.safetensors"
-        print(rank_path)
-        save_file(model_state_dict, os.path.join(args.save_path, rank_path))
 
     return quantized_state_dict, non_quantized_state_dict

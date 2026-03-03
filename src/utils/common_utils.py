@@ -1,4 +1,5 @@
 import gc
+import re
 import random
 import inspect
 import dataclasses
@@ -54,3 +55,19 @@ def maybe_first_element(x):
 def filter_kwarg_dict(fn_or_method: Callable, kwarg_dict: Dict[str, Any]) -> Dict[str, Any]:
     fn_or_method_keys = inspect.signature(fn_or_method).parameters.keys()
     return {k: v for k, v in kwarg_dict.items() if k in fn_or_method_keys}
+
+def get_global_layer_name(layer_name: str, ep_rank: int, num_local_experts: int) -> str:
+    """Convert layer_name with local expert index to global expert index.
+    
+    For example: 'mlp.experts.0.gate_proj' with ep_rank=1, num_local_experts=4
+    becomes 'mlp.experts.4.gate_proj'
+    """
+    # Check if this is an expert layer
+    match = re.match(r'(.*\.experts\.)(\d+)(\..*)', layer_name)
+    if match:
+        prefix = match.group(1)
+        local_idx = int(match.group(2))
+        suffix = match.group(3)
+        global_idx = ep_rank * num_local_experts + local_idx
+        return f"{prefix}{global_idx}{suffix}"
+    return layer_name

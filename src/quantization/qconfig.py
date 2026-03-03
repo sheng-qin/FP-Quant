@@ -5,16 +5,37 @@ def prepare_quantization_config(
     format: str,
     pseudoquantization: bool = False
 ) -> dict[str, Any]:
-    if format in ["mxfp", "nvfp"]:
+    if format in ["nvfp"]:
         return {
-            "forward_dtype": f"{format}4",
-            "backward_dtype": "bf16",
-            "forward_method": "abs_max",
-            "hadamard_group_size":hadamard_group_size,
-            "modules_to_not_convert": ["lm_head"],
-            "quant_method": "fp_quant",
-            "store_master_weights": False,
-            "pseudoquantization": pseudoquantization
+            "config_groups": {
+                "group_0": {
+                    "input_activations": {
+                        "dynamic": False,
+                        "num_bits": 4,
+                        "type": "float",
+                        "group_size": 16
+                    },
+                    "weights": {
+                        "dynamic": False,
+                        "num_bits": 4,
+                        "type": "float",
+                        "group_size": 16
+                    },
+                    "targets": ["Linear"]
+                }
+            },
+            "ignore": ["lm_head"],
+            "quant_algo": "NVFP4",
+            "kv_cache_scheme": {
+                "dynamic": False,
+                "num_bits": 8,
+                "type": "float"
+            },
+            "producer": {
+                "name": "modelopt",
+                "version": "0.35.0"
+            },
+            "quant_method": "modelopt"
         }
     else:
         raise ValueError(f"Invalid format: {format}")

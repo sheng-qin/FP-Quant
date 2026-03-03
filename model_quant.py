@@ -17,7 +17,7 @@ from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
-from src.utils.common_utils import fix_seed
+from src.utils.common_utils import fix_seed, get_global_layer_name
 from src.utils.data_utils import get_data, get_wikitext2
 
 try:
@@ -38,8 +38,28 @@ def auto_or_int(value):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
 
-
-def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args):
+def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, rank=0, world_size=1):
+    if rank > 0:
+        model_state_dict = {}
+        for key, value in quantized_state_dict.items():
+            if key.endswith("gate_up_proj"):
+                gate_layer_name = key.replace("gate_up_proj", "gate_proj")
+                up_layer_name = key.replace("gate_up_proj", "up_proj")
+                for k_compr, v_compr in value.items():
+                    if k_compr in ["weight", "weight_scale"]:
+                        gate_v_compr, up_v_compr = v_compr.chunk(2, dim=0)
+                        model_state_dict[f"{gate_layer_name}.{k_compr}"] = gate_v_compr.cpu()
+                        model_state_dict[f"{up_layer_name}.{k_compr}"] = up_v_compr.cpu()
+                    else:
+                        model_state_dict[f"{gate_layer_name}.{k_compr}"] = v_compr.cpu()
+                        model_state_dict[f"{up_layer_name}.{k_compr}"] = v_compr.cpu()
+            else:
+                for k_compr, v_compr in value.items():
+                    model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
+        current_shard_path = f"model-ep-{rank}-of-{world_size}.safetensors"
+        save_file(model_state_dict, os.path.join(args.save_path, current_shard_path))
+        return
+    
     config = model.config
     # Prepare directory to save model
     os.makedirs(args.save_path, exist_ok=True)
@@ -54,8 +74,20 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         for k, v in block.state_dict().items():
             layer_name, param_name = k.rsplit(".", 1)
             if f"{prefix}{layer_name}" in quantized_state_dict and param_name == "weight":
-                for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
-                    model_state_dict[f"{prefix}{layer_name}.{k_compr}"] = v_compr.cpu()
+                if layer_name.endswith("gate_up_proj"):
+                    gate_layer_name = layer_name.replace("gate_up_proj", "gate_proj")
+                    up_layer_name = layer_name.replace("gate_up_proj", "up_proj")
+                    for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
+                        if k_compr in ["weight", "weight_scale"]:
+                            gate_v_compr, up_v_compr = v_compr.chunk(2, dim=0)
+                            model_state_dict[f"{prefix}{gate_layer_name}.{k_compr}"] = gate_v_compr.cpu()
+                            model_state_dict[f"{prefix}{up_layer_name}.{k_compr}"] = up_v_compr.cpu()
+                        else:
+                            model_state_dict[f"{prefix}{gate_layer_name}.{k_compr}"] = v_compr.cpu()
+                            model_state_dict[f"{prefix}{up_layer_name}.{k_compr}"] = v_compr.cpu()
+                else:
+                    for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
+                        model_state_dict[f"{prefix}{layer_name}.{k_compr}"] = v_compr.cpu()
             elif f"{prefix}{k}" in non_quantized_state_dict:
                 model_state_dict[f"{prefix}{k}"] = non_quantized_state_dict[f"{prefix}{k}"].cpu()
             else:
@@ -104,17 +136,22 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         save_file(shard, os.path.join(args.save_path, current_shard_path))
         for k in shard:
             safetensors_index[k] = current_shard_path
+            if world_size > 1 and 'experts' in k:
+                for ep_r in range(1, world_size):
+                    k_ = get_global_layer_name(k, ep_r, config.num_local_experts)
+                    safetensors_index[k_] = f"model-ep-{ep_r}-of-{world_size}.safetensors"
 
     # Save safetensors index
     with open(os.path.join(args.save_path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
 
     # Add quantization metadata
-    config.quantization_config = prepare_quantization_config(
-        args.hadamard_group_size, 
-        args.format,
-        pseudoquantization=(args.export_quantized_model == "pseudoquant")
-    )
+    if args.export_quantized_model == "realquant":
+        config.quantization_config = prepare_quantization_config(
+            args.hadamard_group_size, 
+            args.format,
+            pseudoquantization=(args.export_quantized_model == "pseudoquant")
+        )
     # Save configs
     config.save_pretrained(args.save_path)
     model.generation_config.save_pretrained(args.save_path)
@@ -352,9 +389,10 @@ def parse_args():
     # Check real_quant config
     if args.export_quantized_model:
         assert args.save_path is not None, "`save_path` must be specified when exporting quantized model."
-        # assert args.format in ["nvfp", "mxfp"], "`export_quantization` is only supported for nvfp and mxfp formats."
-        # assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
-        # assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
+    if args.export_quantized_model == "realquant":
+        assert args.format in ["nvfp", "mxfp"], "`realquant` is only supported for nvfp and mxfp formats."
+        assert args.w_bits == 4, "`realquant` is only supported for 4 bit weights."
+        assert args.a_bits == 4, "`realquant` is only supported for 4 bit activations."
     return args
 
 
@@ -455,9 +493,10 @@ def main():
         else:
             quantized_state_dict, non_quantized_state_dict = rtn_quantization(model, calibration_data, args, device)
 
-        # if args.export_quantized_model:
-        #     export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
-        #     tokenizer.save_pretrained(args.save_path)
+        if args.export_quantized_model:
+            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, rank, world_size) 
+            if rank == 0:
+                tokenizer.save_pretrained(args.save_path)
 
     if args.compile:
         model = torch.compile(model)

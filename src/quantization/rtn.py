@@ -50,7 +50,7 @@ def rtn_quantization(
     if args.w_bits < 16:
         weight_quantizer_kwargs = dict(
             bits=args.w_bits, 
-            symmetric=True, 
+            symmetric= not args.w_asymmetric, 
             format=args.format,
             granularity=args.w_granularity,
             observer=args.w_observer, 

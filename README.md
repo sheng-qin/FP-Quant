@@ -285,6 +285,106 @@ lm_eval \
   --output_path lm_eval_results
 ```
 
+Below is an example for Qwen3Moe quantization with expert parallelism, followed by evaluation through vllm
+
+```shell
+#!/bin/bash
+export OMP_NUM_THREADS=8
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+export HF_ENDPOINT=https://hf-mirror.com
+
+MODEL=${MODEL:-"/root/fshare/models/Qwen/Qwen3-30B-A3B"}
+MODEL_ID=$( echo $MODEL | awk -F/ '{print $NF}' )
+# Data params
+NUM_SEQUENCES=${NUM_SEQUENCES:-1024}
+# Quantization params
+FORMAT=${FORMAT:-"nvfp"}
+W_BITS=${W_BITS:-4}
+A_BITS=${A_BITS:-4}
+W_GROUP_SIZE=${W_GROUP_SIZE:-16}
+A_GROUP_SIZE=${A_GROUP_SIZE:-16}
+GPTQ=${GPTQ:-0}
+W_ASYMMETRIC=${W_ASYMMETRIC:-1}
+W_OBSERVER=${W_OBSERVER:-"mse"}
+QUANTIZATION_ORDER=${QUANTIZATION_ORDER:-"default"}
+# Save params
+EXPORT_QUANTIZATION=${EXPORT_QUANTIZATION:-"pseudoquant"}
+# Transform params
+TRANSFORM_CLASS=${TRANSFORM_CLASS:-"identity"}
+HADAMARD_GROUP_SIZE=${HADAMARD_GROUP_SIZE:-16}
+# Misc params
+DTYPE=${DTYPE:-"auto"}
+CPU_OFFLOAD_ACTIVATIONS=${CPU_OFFLOAD_ACTIVATIONS:-0}
+# Expert parallel params
+EP_SIZE=${EP_SIZE:-4}
+EP_BACKEND=${EP_BACKEND:-"nccl"}
+
+SCRIPT_ARGS=""
+
+if [[ $W_ASYMMETRIC == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --w_asymmetric"
+fi
+
+if [[ $GPTQ == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --gptq"
+fi
+
+METHOD_NAME=""
+if [[ $GPTQ == 1 ]]; then
+    METHOD_NAME="GPTQ"
+else
+    METHOD_NAME="RTN"
+fi
+
+if [[ $CPU_OFFLOAD_MODULES == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --cpu_offload_modules"
+fi
+
+if [[ $CPU_OFFLOAD_ACTIVATIONS == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --cpu_offload_activations"
+fi
+
+if [[ $EXPORT_QUANTIZATION == "realquant" || $EXPORT_QUANTIZATION == "pseudoquant" ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --export_quantized_model ${EXPORT_QUANTIZATION}"
+    SAVE_DIR=/root/models/quantized_models
+fi
+
+# Expert parallel mode - use torchrun
+export WORLD_SIZE=$EP_SIZE
+torchrun --nproc_per_node=$EP_SIZE model_quant.py \
+    --model_name_or_path=${MODEL} \
+    --format=${FORMAT} \
+    --w_bits=${W_BITS} \
+    --a_bits=${A_BITS} \
+    --w_group_size=${W_GROUP_SIZE} \
+    --a_group_size=${A_GROUP_SIZE} \
+    --transform_class=${TRANSFORM_CLASS} \
+    --w_observer=${W_OBSERVER} \
+    --quantization_order=${QUANTIZATION_ORDER} \
+    $SCRIPT_ARGS \
+    --hadamard_group_size=${HADAMARD_GROUP_SIZE} \
+    --dataset_name_or_path=fineweb-edu \
+    --num_sequences=${NUM_SEQUENCES} \
+    --sequence_length=2048 \
+    --dtype=${DTYPE} \
+    --save_path "${SAVE_DIR}/${MODEL_ID}-${FORMAT}-w${W_BITS}-a${A_BITS}-${METHOD_NAME}" \
+    --cpu_offload_activations \
+    --cpu_offload_modules \
+    --fuse_global_scale \
+    --amp \
+    --ep_size=${EP_SIZE} \
+    --ep_backend=${EP_BACKEND}
+
+
+MODEL="${SAVE_DIR}/${MODEL_ID}-${FORMAT}-w${W_BITS}-a${A_BITS}-${METHOD_NAME}"
+MODEL_ARGS="pretrained=$MODEL,dtype=auto,add_bos_token=True,max_model_len=5000,tensor_parallel_size=${EP_SIZE},gpu_memory_utilization=0.8,enable_chunked_prefill=True,enforce_eager=True,trust_remote_code=True"
+
+lm_eval \
+  --model vllm \
+  --model_args $MODEL_ARGS \
+  --tasks gsm8k,mmlu \
+  --batch_size auto
+```
 
 ### Citation
 ---

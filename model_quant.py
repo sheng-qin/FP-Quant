@@ -227,6 +227,11 @@ def parse_args():
         help="Weight observer.",
     )
     parser.add_argument(
+        "--w_asymmetric",
+        action="store_true",
+        help="Whether to use asymmetric quantization in Weight quantization",
+    )
+    parser.add_argument(
         "--a_bits",
         type=int,
         default=16,

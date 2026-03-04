@@ -206,6 +206,7 @@ def rtn_quantization(
 
         # Calibrate activations (if needed)
         if need_calibration:
+            quantized_mlp.amax_calib = True
             device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):

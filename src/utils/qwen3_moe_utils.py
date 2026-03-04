@@ -135,7 +135,7 @@ class QuantizedQwen3MoeSparseMoeBlock(nn.Module):
                     down_in_transform
                 ) for _ in range(self.num_local_experts)]
         )
-        self.amax_calib = True
+        self.amax_calib = False
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
         """

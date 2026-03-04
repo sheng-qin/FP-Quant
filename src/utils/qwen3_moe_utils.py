@@ -135,6 +135,7 @@ class QuantizedQwen3MoeSparseMoeBlock(nn.Module):
                     down_in_transform
                 ) for _ in range(self.num_local_experts)]
         )
+        self.amax_calib = True
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
         """
@@ -189,7 +190,10 @@ class QuantizedQwen3MoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        
+        # HACK route all tokens to all expert to search activation global scale (refer to modelopt) 
+        top_k = self.num_experts if self.amax_calib else self.top_k
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
         if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype

@@ -385,6 +385,15 @@ def gptq_quantization(
         # 3. Fix transforms and remove parametrizations
         ## removed
 
+
+        if args.a_bits < 16:
+            device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+            for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+                with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+                    block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+            quantized_mlp.amax_calib = False
+
+
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
         hooks = {}

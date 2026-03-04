@@ -210,6 +210,7 @@ def rtn_quantization(
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                     block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+            quantized_mlp.amax_calib = False
 
         
         if args.export_quantized_model:

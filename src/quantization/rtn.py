@@ -1,6 +1,7 @@
 import gc
 import re
 import argparse
+import psutil
 from typing import List
 
 import torch
@@ -82,7 +83,7 @@ def rtn_quantization(
                     model(sample.to(device=device))
             except ForwardInterrupt:
                 pass
-            
+
         input_args = blocks[0].input_args
         input_kwargs = blocks[0].input_kwargs
         blocks[0] = blocks[0].module
@@ -92,7 +93,8 @@ def rtn_quantization(
 
     # Iterate over transformer blocks
     for block_idx, block in enumerate(blocks):
-        print(f"Processing block {block_idx}...")
+        if ep_rank == 0:
+            print(f"Processing block {block_idx}... available: {psutil.virtual_memory().available / 1024 / 1024 / 1024:.2f} GB")
         if args.cpu_offload_modules:
             block.to(device)
         # 1. Init transforms
@@ -133,42 +135,7 @@ def rtn_quantization(
             )
 
         quantized_attn.load_state_dict(block.self_attn.state_dict(), strict=False)
-        
-        # For MoE with expert parallel, only load the local experts
-        # Check if model has num_local_experts (set by transformers when EP is enabled)
-        use_ep_filter = False
-        if hasattr(model.config, 'num_local_experts') and model.config.num_local_experts is not None:
-            total_experts = getattr(model.config, 'num_experts', None)
-            num_local_experts = model.config.num_local_experts
-            
-            # Only filter if we have both values and local < total
-            if total_experts is not None and num_local_experts < total_experts:
-                use_ep_filter = True
-                print(f"[Rank {ep_rank}] EP filter: total_experts={total_experts}, num_local_experts={num_local_experts}, ep_size={ep_size}")
-                
-                # Calculate which experts belong to this rank
-                expert_start_idx = ep_rank * num_local_experts
-                
-                # Get full state dict
-                state_dict = block.mlp.state_dict()
-                
-                # Filter to only include local experts
-                local_state_dict = {}
-                for key, value in state_dict.items():
-                    if 'experts.' in key:
-                        parts = key.split('.')
-                        exp_idx = int(parts[1])
-                        # Only include experts that belong to this rank
-                        if exp_idx >= expert_start_idx and exp_idx < expert_start_idx + num_local_experts:
-                            local_key = key.replace(f'experts.{exp_idx}', f'experts.{exp_idx - expert_start_idx}')
-                            local_state_dict[local_key] = value
-                    else:
-                        local_state_dict[key] = value
-                
-                quantized_mlp.load_state_dict(local_state_dict, strict=False)
-        
-        if not use_ep_filter:
-            quantized_mlp.load_state_dict(block.mlp.state_dict(), strict=False)
+        quantized_mlp.load_state_dict(block.mlp.state_dict(), strict=False)
 
         block.self_attn = quantized_attn
         block.mlp = quantized_mlp
@@ -247,7 +214,8 @@ def rtn_quantization(
                         quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
                             "weight": dqweight.cpu(),
                         }  
-        
+                elif hasattr(layer, 'weight'):
+                    non_quantized_state_dict[f"model.layers.{block_idx}.{layer_name}.weight"] = layer.weight.cpu()
 
         # 3. Fix model parametrization
         ## removed
@@ -259,16 +227,18 @@ def rtn_quantization(
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                     out = block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
-                out = maybe_first_element(out).to(act_offload_device)
+                out = maybe_first_element(out)
                 # change only first input argument
                 if len(inp_args) > 0:
-                    inp_args[0].data = out
+                    inp_args[0].data.copy_(out)
                 elif "hidden_states" in inp_kwargs:
-                    inp_kwargs["hidden_states"] = out
+                    inp_kwargs["hidden_states"].copy_(out)
                 else:
                     raise ValueError("Unsupported block input format.")
 
         if args.cpu_offload_modules:
+            block.self_attn = None
+            block.mlp = None
             block.cpu()
 
         clear_device_cache(garbage_collection=True)

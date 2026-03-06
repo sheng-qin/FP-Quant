@@ -39,59 +39,32 @@ def auto_or_int(value):
         raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
 
 def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, rank=0, world_size=1):
+    if rank == 0:
+        # Prepare directory to save model
+        os.makedirs(args.save_path, exist_ok=True)
+
+    model_state_dict = {}
+    for key, value in quantized_state_dict.items():
+        if key.endswith("gate_up_proj"):
+            gate_layer_name = key.replace("gate_up_proj", "gate_proj")
+            up_layer_name = key.replace("gate_up_proj", "up_proj")
+            for k_compr, v_compr in value.items():
+                if k_compr in ["weight", "weight_scale"]:
+                    gate_v_compr, up_v_compr = v_compr.chunk(2, dim=0)
+                    model_state_dict[f"{gate_layer_name}.{k_compr}"] = gate_v_compr.cpu()
+                    model_state_dict[f"{up_layer_name}.{k_compr}"] = up_v_compr.cpu()
+                else:
+                    model_state_dict[f"{gate_layer_name}.{k_compr}"] = v_compr.cpu()
+                    model_state_dict[f"{up_layer_name}.{k_compr}"] = v_compr.clone().cpu()
+        else:
+            for k_compr, v_compr in value.items():
+                model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
     if rank > 0:
-        model_state_dict = {}
-        for key, value in quantized_state_dict.items():
-            if key.endswith("gate_up_proj"):
-                gate_layer_name = key.replace("gate_up_proj", "gate_proj")
-                up_layer_name = key.replace("gate_up_proj", "up_proj")
-                for k_compr, v_compr in value.items():
-                    if k_compr in ["weight", "weight_scale"]:
-                        gate_v_compr, up_v_compr = v_compr.chunk(2, dim=0)
-                        model_state_dict[f"{gate_layer_name}.{k_compr}"] = gate_v_compr.cpu()
-                        model_state_dict[f"{up_layer_name}.{k_compr}"] = up_v_compr.cpu()
-                    else:
-                        model_state_dict[f"{gate_layer_name}.{k_compr}"] = v_compr.cpu()
-                        model_state_dict[f"{up_layer_name}.{k_compr}"] = v_compr.cpu()
-            else:
-                for k_compr, v_compr in value.items():
-                    model_state_dict[f"{key}.{k_compr}"] = v_compr.cpu()
         current_shard_path = f"model-ep-{rank}-of-{world_size}.safetensors"
         save_file(model_state_dict, os.path.join(args.save_path, current_shard_path))
         return
     
     config = model.config
-    # Prepare directory to save model
-    os.makedirs(args.save_path, exist_ok=True)
-
-    blocks = model.model.layers
-
-    # State dict to save
-    model_state_dict = {}
-
-    for block_idx, block in enumerate(blocks):
-        prefix = f"model.layers.{block_idx}."
-        for k, v in block.state_dict().items():
-            layer_name, param_name = k.rsplit(".", 1)
-            if f"{prefix}{layer_name}" in quantized_state_dict and param_name == "weight":
-                if layer_name.endswith("gate_up_proj"):
-                    gate_layer_name = layer_name.replace("gate_up_proj", "gate_proj")
-                    up_layer_name = layer_name.replace("gate_up_proj", "up_proj")
-                    for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
-                        if k_compr in ["weight", "weight_scale"]:
-                            gate_v_compr, up_v_compr = v_compr.chunk(2, dim=0)
-                            model_state_dict[f"{prefix}{gate_layer_name}.{k_compr}"] = gate_v_compr.cpu()
-                            model_state_dict[f"{prefix}{up_layer_name}.{k_compr}"] = up_v_compr.cpu()
-                        else:
-                            model_state_dict[f"{prefix}{gate_layer_name}.{k_compr}"] = v_compr.cpu()
-                            model_state_dict[f"{prefix}{up_layer_name}.{k_compr}"] = v_compr.cpu()
-                else:
-                    for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
-                        model_state_dict[f"{prefix}{layer_name}.{k_compr}"] = v_compr.cpu()
-            elif f"{prefix}{k}" in non_quantized_state_dict:
-                model_state_dict[f"{prefix}{k}"] = non_quantized_state_dict[f"{prefix}{k}"].cpu()
-            else:
-                model_state_dict[f"{prefix}{k}"] = v.cpu()
 
     # Add non_quantized_state_dict block parameters (dict is non-empty for blockwise_qat)
     model_state_dict.update(non_quantized_state_dict)
@@ -444,6 +417,20 @@ def main():
         device_map="cpu" if args.ep_size > 1 else (None if args.cpu_offload_modules else device),
         low_cpu_mem_usage=True,
     )
+    
+    # For EP, delete all experts not belonging to this ep_rank to save memory
+    if args.ep_size > 1:
+        num_local_experts = config.num_local_experts
+        expert_start_idx = rank * num_local_experts
+        expert_end_idx = expert_start_idx + num_local_experts
+        
+        print(f"[Rank {rank}] Keeping experts {expert_start_idx} to {expert_end_idx - 1} (total {num_local_experts} experts)")
+        # Find all MoE layers and delete non-local experts
+        for name, module in model.named_modules():
+            # Check if this module has experts (nn.ModuleList with 'experts' in name)
+            if hasattr(module, 'experts') and isinstance(module.experts, torch.nn.ModuleList):
+                # This is an MoE layer, keep only local experts
+                module.experts = module.experts[expert_start_idx:expert_end_idx]
     
     # Check if model has EP configuration (num_local_experts set by transformers)
     is_moe = hasattr(model.config, 'num_local_experts') and model.config.num_local_experts > 1

@@ -38,7 +38,7 @@ def auto_or_int(value):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
 
-def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, rank=0, world_size=1):
+def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, skip_linear_layer_name=None, rank=0, world_size=1):
     if rank == 0:
         # Prepare directory to save model
         os.makedirs(args.save_path, exist_ok=True)
@@ -123,6 +123,7 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         config.quantization_config = prepare_quantization_config(
             args.hadamard_group_size, 
             args.format,
+            skip_linear_layer_name=skip_linear_layer_name,
             pseudoquantization=(args.export_quantized_model == "pseudoquant")
         )
     # Save configs
@@ -464,29 +465,26 @@ def main():
 
     quantize_anything = args.w_bits < 16 or args.a_bits < 16
 
-    # Prepare calibration data
+    # Prepare calibration data (data parallel: each rank loads its own portion)
     calibration_data = get_data(
         args.dataset_name_or_path,
         tokenizer,
         args.sequence_length,
         args.num_sequences,
-        args.seed
+        args.seed,
+        rank,
+        world_size
     )
-    
-    # Distribute calibration data across ranks for EP
-    if args.ep_size > 1:
-        num_seq_per_rank = len(calibration_data) // world_size
-        calibration_data = calibration_data[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
-        print(f"Rank {rank}: processing {len(calibration_data)} calibration sequences")
+    print(f"Rank {rank}: loaded {len(calibration_data)} calibration sequences")
 
     if quantize_anything:
         if args.gptq:
-            quantized_state_dict, non_quantized_state_dict = gptq_quantization(model, calibration_data, args, device)
+            quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = gptq_quantization(model, calibration_data, args, device)
         else:
-            quantized_state_dict, non_quantized_state_dict = rtn_quantization(model, calibration_data, args, device)
+            quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = rtn_quantization(model, calibration_data, args, device)
 
         if args.export_quantized_model:
-            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, rank, world_size) 
+            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, skip_linear_layer_name, rank, world_size) 
             if rank == 0:
                 tokenizer.save_pretrained(args.save_path)
 

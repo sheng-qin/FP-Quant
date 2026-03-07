@@ -109,6 +109,7 @@ class Quantizer:
         """
         Get scale and zero point for an input tensor.
         """
+        epsilon = 1e-10
         dim = x.ndim - 1 if self.dim == -1 else self.dim
         if self.granularity == QuantizationGranularity.GROUP:
             reduce_dim = dim + 1
@@ -178,8 +179,8 @@ class Quantizer:
             # NOTE (in quartet x.abs().max() is defined as a scale insteaf of x.abs().max() / q_max )
             scales = cast_to_eBm0(FP4_E2M1_MAX * scales, ebits=8, emax=2) / FP4_SCALE
 
-        # Set scales to 1 if zero
-        scales[scales == 0] = 1
+        # Set scales to 1, (scales / global_scale).to(torch.float8_e4m3fn) may be nan. So set scales to epsilon
+        scales[scales == 0] = epsilon
 
         if scales.isnan().any():
             raise ValueError(f"Scales are not finite.")

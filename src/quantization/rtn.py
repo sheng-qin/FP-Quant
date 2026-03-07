@@ -29,6 +29,7 @@ def rtn_quantization(
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
+    skip_linear_layer_name = []
     
     # Check for expert parallel
     ep_size = 1
@@ -183,6 +184,9 @@ def rtn_quantization(
         
         if args.export_quantized_model:
             for layer_name, layer in block.named_modules():
+                # other ep ranks only process experts
+                if not "experts" in layer_name and ep_rank > 0:
+                    continue
                 if isinstance(layer, QLinear):
                     with torch.no_grad():
                         ## removed
@@ -216,6 +220,8 @@ def rtn_quantization(
                         }  
                 elif hasattr(layer, 'weight'):
                     non_quantized_state_dict[f"model.layers.{block_idx}.{layer_name}.weight"] = layer.weight.cpu()
+                    if isinstance(layer, torch.nn.Linear):
+                        skip_linear_layer_name.append(f"model.layers.{block_idx}.{layer_name}")
 
         # 3. Fix model parametrization
         ## removed
@@ -245,4 +251,4 @@ def rtn_quantization(
 
     clear_device_cache(garbage_collection=True)
 
-    return quantized_state_dict, non_quantized_state_dict
+    return quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name

@@ -214,8 +214,13 @@ def get_data(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
     num_calibration_samples: Optional[int] = None,
-    seed: int = 42
+    seed: int = 42,
+    rank: int = 0,
+    world_size: int = 1
 ) -> List[torch.Tensor]:
+    # For data parallel, each rank uses a different seed to get different samples
+    seed += rank * 100
+    num_calibration_samples /= world_size
     if dataset_name == "open-thoughts":
         return get_open_thoughts(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "open-platypus":

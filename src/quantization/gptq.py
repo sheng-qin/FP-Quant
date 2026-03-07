@@ -236,6 +236,7 @@ def gptq_quantization(
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
+    skip_linear_layer_name = []
     
     # Check for expert parallel
     ep_size = 1
@@ -459,10 +460,12 @@ def gptq_quantization(
                         "weight": dequantized_qweight.cpu(),
                     }  
 
-        if args.export_quantized_model:
+        if args.export_quantized_model and ep_rank == 0:
             for layer_name, layer in block.named_modules():
                 if not isinstance(layer, QLinear) and hasattr(layer, 'weight'):
                     non_quantized_state_dict[f"model.layers.{block_idx}.{layer_name}.weight"] = layer.weight.cpu()
+                    if isinstance(layer, torch.nn.Linear):
+                        skip_linear_layer_name.append(f"model.layers.{block_idx}.{layer_name}")
 
         # 8. Update activations
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
@@ -490,4 +493,4 @@ def gptq_quantization(
 
     clear_device_cache(garbage_collection=True)
 
-    return quantized_state_dict, non_quantized_state_dict
+    return quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name

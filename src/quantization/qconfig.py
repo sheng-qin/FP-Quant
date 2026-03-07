@@ -3,8 +3,15 @@ from typing import Any
 def prepare_quantization_config(
     hadamard_group_size: int, 
     format: str,
+    skip_linear_layer_name: list = None,
     pseudoquantization: bool = False
 ) -> dict[str, Any]:
+    # Default ignore list
+    ignore_list = ["lm_head"]
+    
+    # Add skip_linear_layer_name to ignore list if provided
+    if skip_linear_layer_name:
+        ignore_list.extend(skip_linear_layer_name)
     if format in ["nvfp"]:
         return {
             "config_groups": {
@@ -24,7 +31,7 @@ def prepare_quantization_config(
                     "targets": ["Linear"]
                 }
             },
-            "ignore": ["lm_head"],
+            "ignore": ignore_list,
             "quant_algo": "NVFP4",
             "kv_cache_scheme": {
                 "dynamic": False,

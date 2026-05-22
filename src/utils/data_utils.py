@@ -7,6 +7,26 @@ import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 
+FINEWEB_EDU_DEFAULT_DATA_FILE = (
+    "hf://datasets/HuggingFaceFW/fineweb-edu/sample/10BT/000_00000.parquet"
+)
+
+
+def get_synthetic_calibration_data(
+    tokenizer: AutoTokenizer,
+    max_sequence_length: int,
+    num_calibration_samples: int,
+) -> List[torch.Tensor]:
+    target_tokens = max_sequence_length * num_calibration_samples
+    input_ids = tokenizer("FP Quant calibration sample. ", return_tensors="pt").input_ids
+    while input_ids.shape[1] < target_tokens:
+        input_ids = torch.cat([input_ids, input_ids], dim=1)
+    input_ids = input_ids[:, :target_tokens]
+    return [
+        input_ids[:, i * max_sequence_length : (i + 1) * max_sequence_length]
+        for i in range(num_calibration_samples)
+    ]
+
 
 # Only for evaluation
 def get_wikitext2(tokenizer: AutoTokenizer,  sequence_length: int):
@@ -25,11 +45,13 @@ def get_c4(
     num_calibration_samples: Optional[int] = None,
     seed: int = 42
 ):
-    train_datasetraw = load_dataset(
-        'allenai/c4', 
-        data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, 
-        split='train'
-    )
+    # train_datasetraw = load_dataset(
+    #     'allenai/c4', 
+    #     data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, 
+    #     split='train'
+    # )
+    print("Loading WikiText-2 for calibration...")
+    train_datasetraw = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     all_id =[]
     trainloader = []
     for _ in range(num_calibration_samples):
@@ -117,14 +139,46 @@ def get_fineweb_edu(
     seed: int = 42,
     local_data_file: Optional[str] = "",
 ) -> List[torch.Tensor]:
+    if os.environ.get("FP_QUANT_SYNTHETIC_FINEWEB") == "1":
+        print("Using synthetic FineWeb-Edu calibration data")
+        return get_synthetic_calibration_data(
+            tokenizer,
+            max_sequence_length,
+            int(num_calibration_samples),
+        )
+
+    # if local_data_file and os.path.exists(local_data_file):
+    #     print(f"Loading dataset from local Arrow file: {local_data_file}")
+    #     train_dataset_raw = Dataset.from_file(local_data_file)
+    # else:
+    #     print("Local file not found, switching to streaming...")
+    #     train_dataset_raw = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+    #     train_dataset_raw = train_dataset_raw.shuffle(seed=seed, buffer_size=1_000)
+
     if local_data_file and os.path.exists(local_data_file):
         print(f"Loading dataset from local file: {local_data_file}")
         with open(local_data_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         train_dataset_raw = Dataset.from_list(data)
     else:
-        train_dataset_raw = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+        fineweb_data_files = [
+            file_path.strip()
+            for file_path in os.environ.get(
+                "FP_QUANT_FINEWEB_DATA_FILES",
+                FINEWEB_EDU_DEFAULT_DATA_FILE,
+            ).split(",")
+            if file_path.strip()
+        ]
+        print(f"Streaming FineWeb-Edu from {len(fineweb_data_files)} parquet shard(s)")
+        train_dataset_raw = load_dataset(
+            "parquet",
+            data_files={"train": fineweb_data_files},
+            split="train",
+            streaming=True,
+        )
         train_dataset_raw = train_dataset_raw.shuffle(seed=seed, buffer_size=1_000)
+        print(f"Loading is done")
+
     trainloader = []
     for j, sample in enumerate(train_dataset_raw):
         trainenc = tokenizer(
@@ -220,7 +274,8 @@ def get_data(
 ) -> List[torch.Tensor]:
     # For data parallel, each rank uses a different seed to get different samples
     seed += rank * 100
-    num_calibration_samples /= world_size
+    # num_calibration_samples /= world_size
+    num_calibration_samples = int(num_calibration_samples // world_size)
     if dataset_name == "open-thoughts":
         return get_open_thoughts(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "open-platypus":
@@ -228,6 +283,8 @@ def get_data(
     if dataset_name == "ultrachat-200k":
         return get_ultrachat_200k(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "fineweb-edu":
+        # local_data_file = "/root/.cache/huggingface/datasets/wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-train.arrow"
+        # return get_fineweb_edu(tokenizer, max_sequence_length, num_calibration_samples, seed, local_data_file=local_data_file)
         return get_fineweb_edu(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "c4":
         return get_c4(tokenizer, max_sequence_length, num_calibration_samples, seed)

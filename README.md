@@ -111,6 +111,7 @@ A_BITS=${A_BITS:-16}
 W_GROUP_SIZE=${W_GROUP_SIZE:-16}
 A_GROUP_SIZE=${A_GROUP_SIZE:-16}
 GPTQ=${GPTQ:-0}
+SMOOTHQUANT=${SMOOTHQUANT:-0}
 W_OBSERVER=${W_OBSERVER:-"minmax"}
 QUANTIZATION_ORDER=${QUANTIZATION_ORDER:-"default"}
 # Save params
@@ -133,6 +134,10 @@ if [[ $GPTQ == 1 ]]; then
     SCRIPT_ARGS="${SCRIPT_ARGS} --gptq"
 fi
 
+if [[ $SMOOTHQUANT == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --smoothquant"
+fi
+
 if [[ $EVAL_PERPLEXITY == 1 ]]; then
     SCRIPT_ARGS="${SCRIPT_ARGS} --eval_perplexity"
 fi
@@ -148,6 +153,8 @@ fi
 METHOD_NAME=""
 if [[ $GPTQ == 1 ]]; then
     METHOD_NAME="GPTQ"
+elif [[ $SMOOTHQUANT == 1 ]]; then
+    METHOD_NAME="SmoothQuant"
 else
     METHOD_NAME="RTN"
 fi
@@ -204,6 +211,8 @@ Above:
 * `--a_bits` - The number of bits to quantize the activations to.
 * `--w_group_size` - The number of weights to quantize together.
 * `--a_group_size` - The number of activations to quantize together.
+* `--smoothquant` - Whether to run SmoothQuant calibration and smoothing before quantization.
+* `--smoothquant_alpha` - SmoothQuant migration strength between activation and weight ranges. The default is `0.5`.
 * `--init` - Transform initialization.
 * `--transform_class` - Transform class. We provide the following options:
     * `identity` - Identity transform

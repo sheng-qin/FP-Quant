@@ -207,12 +207,18 @@ def rtn_quantization(
                     # Convert layer_name to use global expert index if EP is enabled
                     global_layer_name = get_global_layer_name(layer_name, ep_rank, model.config.num_local_experts) if is_moe and ep_size > 1 else layer_name
                     if args.export_quantized_model == "realquant":
-                        quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
-                            "weight": pack_fp4_to_uint8(qweight).cpu(),
-                            "weight_scale": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
-                            "weight_scale_2": 1 / weight_global_scale.clone(),
-                            "input_scale": 1 / act_global_scale.clone()
-                        }
+                        if args.format == "int":
+                            quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
+                                "weight": qweight.to(torch.int8).cpu(),
+                                "weight_scale": scales.float().cpu(),
+                            }
+                        else:
+                            quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
+                                "weight": pack_fp4_to_uint8(qweight).cpu(),
+                                "weight_scale": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
+                                "weight_scale_2": 1 / weight_global_scale.clone(),
+                                "input_scale": 1 / act_global_scale.clone()
+                            }
                     # pseudoquant
                     else:
                         quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {

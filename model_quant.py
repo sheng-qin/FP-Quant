@@ -15,10 +15,15 @@ from lm_eval.models.huggingface import HFLM
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
-from src.quantization.qconfig import prepare_quantization_config
-from src.quantization import rtn_quantization, gptq_quantization
+from src.quantization.qconfig import (
+    prepare_compressed_tensors_w8a8_config,
+    prepare_quantization_config,
+)
+from src.quantization import rtn_quantization, gptq_quantization, smoothquant_quantization
 from src.utils.common_utils import fix_seed, get_global_layer_name
 from src.utils.data_utils import get_data, get_wikitext2
+
+os.environ["HF_HUB_HTTP_TIMEOUT"] = "120"
 
 try:
     import wandb
@@ -118,14 +123,35 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
     with open(os.path.join(args.save_path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
 
+    smoothquant_scale_state_dict = getattr(args, "smoothquant_scale_state_dict", None)
+    if smoothquant_scale_state_dict:
+        smoothquant_scale_path = "smoothquant_scales.safetensors"
+        save_file(
+            {k: v.detach().cpu().clone() for k, v in smoothquant_scale_state_dict.items()},
+            os.path.join(args.save_path, smoothquant_scale_path),
+        )
+        config.smoothquant_config = {
+            "scale_file": smoothquant_scale_path,
+            "scale_key_suffix": "smoothquant_scale",
+            "runtime_application": "folded_into_quantized_weights",
+            "alpha": args.smoothquant_alpha,
+            "searched_alpha": args.smoothquant_search_alpha,
+        }
+
     # Add quantization metadata
     if args.export_quantized_model == "realquant":
-        config.quantization_config = prepare_quantization_config(
-            args.hadamard_group_size, 
-            args.format,
-            skip_linear_layer_name=skip_linear_layer_name,
-            pseudoquantization=(args.export_quantized_model == "pseudoquant")
-        )
+        if args.format == "int":
+            config.quantization_config = prepare_compressed_tensors_w8a8_config(
+                weight_strategy=args.w_granularity,
+                skip_linear_layer_name=skip_linear_layer_name,
+            )
+        else:
+            config.quantization_config = prepare_quantization_config(
+                args.hadamard_group_size, 
+                args.format,
+                skip_linear_layer_name=skip_linear_layer_name,
+                pseudoquantization=(args.export_quantized_model == "pseudoquant")
+            )
     # Save configs
     config.save_pretrained(args.save_path)
     model.generation_config.save_pretrained(args.save_path)
@@ -252,6 +278,47 @@ def parse_args():
         help="Weigth quantization order in GPTQ.",
     )
     parser.add_argument("--rel_damp", type=float, default=1e-2)
+    # SmoothQuant params
+    parser.add_argument(
+        "--smoothquant",
+        action="store_true",
+        help="Run SmoothQuant quantization.",
+    )
+    parser.add_argument(
+        "--smoothquant_alpha",
+        type=float,
+        default=None,
+        help="Fixed SmoothQuant migration strength between activation and weight ranges. Required when alpha search is disabled.",
+    )
+    parser.add_argument(
+        "--smoothquant_search_alpha",
+        action="store_true",
+        help="Search for the best SmoothQuant alpha on a per-block grid.",
+    )
+    parser.add_argument(
+        "--smoothquant_alpha_min",
+        type=float,
+        default=0.0,
+        help="Minimum alpha used when searching SmoothQuant alpha.",
+    )
+    parser.add_argument(
+        "--smoothquant_alpha_max",
+        type=float,
+        default=1.0,
+        help="Maximum alpha used when searching SmoothQuant alpha.",
+    )
+    parser.add_argument(
+        "--smoothquant_alpha_grid_size",
+        type=int,
+        default=21,
+        help="Number of evenly spaced alpha values to try during SmoothQuant alpha search.",
+    )
+    parser.add_argument(
+        "--smoothquant_scale_min",
+        type=float,
+        default=1e-5,
+        help="Minimum SmoothQuant scale used to avoid division by zero.",
+    )
     # Transform params
     parser.add_argument(
         "--transform_class",
@@ -369,9 +436,46 @@ def parse_args():
     if args.export_quantized_model:
         assert args.save_path is not None, "`save_path` must be specified when exporting quantized model."
     if args.export_quantized_model == "realquant":
-        assert args.format in ["nvfp", "mxfp"], "`realquant` is only supported for nvfp and mxfp formats."
-        assert args.w_bits == 4, "`realquant` is only supported for 4 bit weights."
-        assert args.a_bits == 4, "`realquant` is only supported for 4 bit activations."
+        int8_realquant = (
+            args.format == "int"
+            and args.w_bits == 8
+            and args.a_bits == 8
+        )
+        fp4_realquant = (
+            args.format in ["nvfp", "mxfp"]
+            and args.w_bits == 4
+            and args.a_bits == 4
+        )
+        assert int8_realquant or fp4_realquant, (
+            "`realquant` supports either int W8A8 compressed-tensors export "
+            "or nvfp/mxfp W4A4 export."
+        )
+        if int8_realquant and args.w_granularity == "group":
+            args.w_granularity = "channel"
+            args.w_group_size = None
+            print(
+                "Changed weight granularity to channel for vLLM "
+                "compressed-tensors W8A8 realquant export."
+            )
+    if args.smoothquant:
+        if args.export_quantized_model == "realquant":
+            assert (
+                args.format == "int"
+                and args.w_bits == 8
+                and args.a_bits == 8
+            ), "SmoothQuant realquant export is supported only for int W8A8."
+        if args.smoothquant_search_alpha:
+            assert args.smoothquant_alpha_grid_size >= 1, "`smoothquant_alpha_grid_size` must be at least 1."
+            assert 0 <= args.smoothquant_alpha_min <= 1, "`smoothquant_alpha_min` must be between 0 and 1."
+            assert 0 <= args.smoothquant_alpha_max <= 1, "`smoothquant_alpha_max` must be between 0 and 1."
+            assert args.smoothquant_alpha_min <= args.smoothquant_alpha_max, (
+                "`smoothquant_alpha_min` must be less than or equal to `smoothquant_alpha_max`."
+            )
+        else:
+            assert args.smoothquant_alpha is not None, (
+                "`smoothquant_alpha` must be provided when SmoothQuant alpha search is disabled."
+            )
+            assert 0 <= args.smoothquant_alpha <= 1, "`smoothquant_alpha` must be between 0 and 1."
     return args
 
 
@@ -477,11 +581,17 @@ def main():
     )
     print(f"Rank {rank}: loaded {len(calibration_data)} calibration sequences")
 
-    if quantize_anything:
-        if args.gptq:
-            quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = gptq_quantization(model, calibration_data, args, device)
+    if quantize_anything or args.smoothquant:
+        if args.smoothquant:
+            if args.gptq:
+                quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = gptq_quantization(model, calibration_data, args, device)
+            else:
+                quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = smoothquant_quantization(model, calibration_data, args, device)
         else:
-            quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = rtn_quantization(model, calibration_data, args, device)
+            if args.gptq:
+                quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = gptq_quantization(model, calibration_data, args, device)
+            else:
+                quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name = rtn_quantization(model, calibration_data, args, device)
 
         if args.export_quantized_model:
             export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, skip_linear_layer_name, rank, world_size) 

@@ -13,6 +13,13 @@ from transformers import AutoModelForCausalLM
 
 from .qlinear import QLinear
 from .quantizer import Quantizer
+from .smoothquant import (
+    _fold_smoothquant_scale_into_weight,
+    apply_smoothquant_to_block,
+    collect_smoothquant_activation_maxes,
+    collect_smoothquant_scale_state,
+    fix_smoothquant_block,
+)
 from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
 from ..transforms.transforms import build_transform, get_transform_matrix
@@ -231,11 +238,12 @@ def gptq_quantization(
     device: torch.device
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     print("GPTQ quantization...")
-    orig_dtype = model.config.torch_dtype if args.dtype == "auto" else args.dtype
+    orig_dtype = model.config.torch_dtype if isinstance(args.dtype, str) and args.dtype == "auto" else args.dtype
     act_offload_device = "cpu" if args.cpu_offload_activations else device
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
+    smoothquant_scale_state_dict = {}
     skip_linear_layer_name = []
     
     # Check for expert parallel
@@ -350,9 +358,23 @@ def gptq_quantization(
         # Toggle off gradients for all parameters
         block.requires_grad_(False)
 
-        # 3. Fix transforms and remove parametrizations
-        ## removed
-
+        # 3. Apply SmoothQuant scaling before GPTQ collects layer inputs.
+        if args.smoothquant:
+            activation_maxes = collect_smoothquant_activation_maxes(block, input_args, input_kwargs, args, device)
+            apply_smoothquant_to_block(block, activation_maxes, input_args, input_kwargs, args, device)
+            fix_smoothquant_block(block)
+            if args.export_quantized_model:
+                smoothquant_scale_state_dict.update(
+                    collect_smoothquant_scale_state(
+                        block,
+                        block_idx,
+                        model.config,
+                        is_moe,
+                        ep_rank,
+                        ep_size,
+                    )
+                )
+            del activation_maxes
 
         if args.a_bits < 16:
             quantized_mlp.amax_calib = True
@@ -412,6 +434,8 @@ def gptq_quantization(
         # 5. Process calibration data
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
         for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+            if not isinstance(inp_args, (list, tuple)):
+                inp_args = (inp_args,)
             with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                 block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
         # Remove hooks
@@ -456,6 +480,12 @@ def gptq_quantization(
                     }
                 # pseudoquant
                 else:
+                    if args.smoothquant:
+                        dequantized_qweight = _fold_smoothquant_scale_into_weight(
+                            block,
+                            layer_name,
+                            dequantized_qweight,
+                        )
                     quantized_state_dict[f"model.layers.{block_idx}.{global_layer_name}"] = {
                         "weight": dequantized_qweight.cpu(),
                     }  
@@ -492,5 +522,7 @@ def gptq_quantization(
         clear_device_cache(garbage_collection=True)
 
     clear_device_cache(garbage_collection=True)
+    if args.smoothquant:
+        args.smoothquant_scale_state_dict = smoothquant_scale_state_dict
 
     return quantized_state_dict, non_quantized_state_dict, skip_linear_layer_name

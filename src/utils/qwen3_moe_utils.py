@@ -50,9 +50,11 @@ class QuantizedQwen3MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        x = self.gate_up_in_transform(x)
         gate_up_output = self.gate_up_proj(x, self.gate_up_in_transform)
         gate_output, up_output = gate_up_output.chunk(2, dim=-1)
-        down_proj = self.down_proj(self.act_fn(gate_output) * up_output, self.down_in_transform)
+        x = self.down_in_transform(self.act_fn(gate_output) * up_output)
+        down_proj = self.down_proj(x, self.down_in_transform)
         return down_proj
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
@@ -247,4 +249,4 @@ class QuantizedQwen3MoeSparseMoeBlock(nn.Module):
                 dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM, group=self.ep_group)
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         # print(final_hidden_states)
-        return final_hidden_states, router_logits
+        return final_hidden_states
